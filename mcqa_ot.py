@@ -2,7 +2,7 @@ from scipy.spatial.distance import cdist
 import numpy as np
 import torch
 
-def solve_ot(G, S, eps=0.05, tau=1.0, metric="sqeuclidean", num_iters=1000, tol=1e-9):
+def solve_ot(G, S, eps=0.05, tau=1.0, metric="sqeuclidean", num_iters=10000, tol=1e-9):
 
     C = torch.as_tensor(
         cdist(np.asarray(G, dtype=np.float64), np.asarray(S, dtype=np.float64), metric=metric),
@@ -23,7 +23,7 @@ def solve_ot(G, S, eps=0.05, tau=1.0, metric="sqeuclidean", num_iters=1000, tol=
     return torch.exp(H(u, v))
 
 
-def solve_uot(G, S, eps=0.05, tau=1.0, reg_m=(1.0, 1.0), metric="sqeuclidean", num_iters=1000, tol=1e-9):
+def solve_uot(G, S, eps=0.05, tau=1.0, reg_m=(1.0, 1.0), metric="sqeuclidean", num_iters=10000, tol=1e-9):
 
     C = torch.as_tensor(
         cdist(np.asarray(G, dtype=np.float64), np.asarray(S, dtype=np.float64), metric=metric),

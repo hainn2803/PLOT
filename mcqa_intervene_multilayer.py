@@ -347,6 +347,7 @@ def run_intervention(
     attention_mask,
     position_by_id,
     sites,
+    site_weights,
     source_states,
     bases,
     strength=1.0,
@@ -402,7 +403,9 @@ def run_intervention(
                 hidden_new = hidden
                 changed = False
 
-                for site in sites:
+                for site_idx in range(len(sites)):
+                    site = sites[site_idx]
+
                     L, token_id, start_dim, end_dim = site
                     L = int(L)
 
@@ -416,12 +419,23 @@ def run_intervention(
                     key = (L, token_id)
                     pos = pos_by_token[token_id]
 
+                    # Current activation on the current trajectory
                     base_acts = hidden_new[rows, pos, :].float()
 
                     source_acts = source_states[key][start:end]
-                    source_acts = source_acts.to(device=device, dtype=torch.float32)
+                    source_acts = source_acts.to(
+                        device=device,
+                        dtype=torch.float32,
+                    )
 
                     basis = bases[key]
+
+                    # Coupling-weighted intervention strength
+                    site_weight = float(site_weights[site_idx])
+
+                    effective_strength = (
+                        float(strength) * site_weight
+                    )
 
                     if basis["mode"] == "pca":
                         comps = basis["components"].to(
@@ -435,7 +449,10 @@ def run_intervention(
                         diff_z = diff_x @ selected_comps.T
                         delta_x = diff_z @ selected_comps
 
-                        patched_acts = base_acts + strength * delta_x
+                        patched_acts = (
+                            base_acts
+                            + effective_strength * delta_x
+                        )
 
                     elif basis["mode"] == "neuron":
                         patched_acts = base_acts.clone()
@@ -447,10 +464,12 @@ def run_intervention(
 
                         patched_acts[:, start_dim:end_dim] = (
                             base_acts[:, start_dim:end_dim]
-                            + strength * delta
+                            + effective_strength * delta
                         )
 
-                    hidden_new[rows, pos, :] = patched_acts.to(hidden_new.dtype)
+                    hidden_new[rows, pos, :] = patched_acts.to(
+                        hidden_new.dtype
+                    )
 
                 if changed:
                     if isinstance(output, tuple):
@@ -463,16 +482,21 @@ def run_intervention(
             return hook
 
         for layer_id in layer_ids:
-            handle = model.model.layers[layer_id].register_forward_hook(
+            handle = model.model.layers[
+                layer_id
+            ].register_forward_hook(
                 make_hook(layer_id)
             )
+
             handles.append(handle)
 
         try:
             outputs = model.model(
                 input_ids=ids,
                 attention_mask=mask,
-                position_ids=(mask.long().cumsum(dim=-1) - 1).clamp(min=0),
+                position_ids=(
+                    mask.long().cumsum(dim=-1) - 1
+                ).clamp(min=0),
                 use_cache=False,
                 return_dict=True,
             )
@@ -485,7 +509,10 @@ def run_intervention(
             )
 
             collected_outputs.append(
-                probs.detach().to(dtype=output_dtype, device="cpu")
+                probs.detach().to(
+                    dtype=output_dtype,
+                    device="cpu",
+                )
             )
 
         finally:
@@ -603,6 +630,7 @@ def site_signature(
             attention_mask=base_attention_mask,
             position_by_id=bank["base_position_by_id"],
             sites=[site],
+            site_weights=[1.0],
             source_states=source_states,
             bases=bases,
             strength=strength,
@@ -654,6 +682,180 @@ def compute_iia(output_probs, target_labels):
 
     return (pred == target).float().mean().item()
 
+
+def evaluate_stage_B_candidate(
+    model,
+    var_id,
+    var_name,
+    stage_A_layers,
+    resolution,
+    top_k,
+    strength,
+    G_sig,
+    ft_bank,
+    cal_bank,
+    fine_cache,
+    stage_B_solver,
+    stage_B_eps,
+    answer_label_ids,
+    chosen_token_position_id,
+    hidden_size,
+    output_dtype=torch.float16,
+    batch_size=32,
+):
+    """
+    Evaluate one Stage-B configuration:
+        (resolution, top_k, strength)
+
+    Returns:
+        candidate: dict
+    """
+
+    # ========================================================
+    # 1. Build cache key
+    # ========================================================
+    layer_key_list = []
+
+    for L in stage_A_layers:
+        layer_key_list.append(int(L))
+
+    layer_key = tuple(layer_key_list)
+
+    cache_key = (
+        layer_key,
+        int(resolution),
+    )
+
+    # ========================================================
+    # 2. Build fine candidate sites and OT once per
+    #    (stage_A_layers, resolution)
+    # ========================================================
+    if cache_key not in fine_cache:
+        sites_fine = []
+
+        for L in stage_A_layers:
+            layer_sites = make_native_sites_for_layer(
+                layer_id=int(L),
+                token_id=chosen_token_position_id,
+                hidden_size=hidden_size,
+                resolution=resolution,
+            )
+
+            for site in layer_sites:
+                sites_fine.append(site)
+
+        sig_fine = site_signature(
+            model=model,
+            bank=ft_bank,
+            sites=sites_fine,
+            answer_label_ids=answer_label_ids,
+            mode="neuron",
+            k=None,
+            strength=1.0,
+            batch_size=batch_size,
+            output_dtype=output_dtype,
+            return_bases=True,
+        )
+
+        S_fine_sig = sig_fine["intervention_diff"]
+
+        T_fine = stage_B_solver(
+            G_sig,
+            S_fine_sig,
+            eps=stage_B_eps,
+        )
+
+        fine_cache[cache_key] = {
+            "stage_A_layers": layer_key,
+            "sites_fine": sites_fine,
+            "T_fine": T_fine,
+            "S_fine": S_fine_sig,
+            "bases": sig_fine["bases"],
+        }
+
+    # ========================================================
+    # 3. Read cached Stage-B objects
+    # ========================================================
+    cached = fine_cache[cache_key]
+
+    sites_fine = cached["sites_fine"]
+    T_fine = cached["T_fine"]
+    bases_fine = cached["bases"]
+
+    # ========================================================
+    # 4. Select top-k sites
+    # ========================================================
+    selected_sites, selected_indices = select_top_sites_from_T(
+        T=T_fine,
+        sites=sites_fine,
+        var_id=var_id,
+        top_k=top_k,
+    )
+
+    # ========================================================
+    # 5. Collect source activations on D_cal
+    # ========================================================
+    cal_source_states = collect_site_activations(
+        model=model,
+        input_ids=cal_bank["source_input_ids"],
+        attention_mask=cal_bank["source_attention_mask"],
+        position_by_id=cal_bank["source_position_by_id"],
+        sites=selected_sites,
+        batch_size=batch_size,
+        return_output=False,
+        answer_label_ids=answer_label_ids,
+        output_dtype=output_dtype,
+    )
+
+    # ========================================================
+    # 6. Run intervention
+    # ========================================================
+    selected_weights = T_fine[var_id, selected_indices]
+
+    selected_weights = selected_weights.detach().float().cpu()
+
+    cal_output = run_intervention(
+        model=model,
+        input_ids=cal_bank["base_input_ids"],
+        attention_mask=cal_bank["base_attention_mask"],
+        position_by_id=cal_bank["base_position_by_id"],
+        sites=selected_sites,
+        site_weights=selected_weights,
+        source_states=cal_source_states,
+        bases=bases_fine,
+        strength=float(strength),
+        batch_size=32,
+        answer_label_ids=answer_label_ids,
+        output_dtype=torch.float16,
+    )
+
+    # ========================================================
+    # 7. Compute calibration IIA
+    # ========================================================
+    cal_iia = compute_iia(
+        output_probs=cal_output,
+        target_labels=cal_bank[
+            "counterfactual_label_ids"
+        ][var_name],
+    )
+
+    # ========================================================
+    # 8. Return candidate metadata
+    # ========================================================
+    candidate = {
+        "var_id": int(var_id),
+        "var_name": var_name,
+        "stage_A_layers": layer_key,
+        "resolution": int(resolution),
+        "top_k": int(top_k),
+        "strength": float(strength),
+        "cal_iia": float(cal_iia),
+        "selected_indices": selected_indices,
+        "selected_sites": selected_sites,
+        "cache_key": cache_key,
+    }
+
+    return candidate
 
 
 
@@ -781,12 +983,11 @@ def run_plot_progressive(
 
 
     # ============================================================
-    # 4. Stage A calibration:
-    #    top-6 layers from T_coarse, then choose best by D_cal IIA
+    # 4. Stage A selection:
+    #    keep top-K raw layers directly from T_coarse
     # ============================================================
-    best_layer_var = {}
-    best_coarse_by_var = {}
-    stage_A_cal_results = []
+    top_layers_var = {}
+    top_coarse_by_var = {}
 
     for var_id in range(len(names)):
         var_name = names[var_id]
@@ -798,10 +999,11 @@ def run_plot_progressive(
             top_k=stage_A_top_layers,
         )
 
-        best_candidate = None
+        selected_layers = []
+        selected_candidates = []
 
         print()
-        print("[Stage A CAL variable]", var_id, var_name)
+        print("[Stage A variable]", var_id, var_name)
 
         for site_pos in range(len(top_sites)):
             site = top_sites[site_pos]
@@ -809,78 +1011,42 @@ def run_plot_progressive(
 
             L, token_id, start_dim, end_dim = site
             L = int(L)
+            site_index = int(site_index)
 
-            cal_source_states = collect_site_activations(
-                model=model,
-                input_ids=cal_bank["source_input_ids"],
-                attention_mask=cal_bank["source_attention_mask"],
-                position_by_id=cal_bank["source_position_by_id"],
-                sites=[site],
-                batch_size=32,
-                return_output=False,
-                answer_label_ids=answer_label_ids,
-                output_dtype=torch.float16,
+            coupling_mass = float(
+                T_coarse[var_id, site_index].detach().cpu()
             )
 
-            for strength in stage_A_strength_values:
-                cal_output = run_intervention(
-                    model=model,
-                    input_ids=cal_bank["base_input_ids"],
-                    attention_mask=cal_bank["base_attention_mask"],
-                    position_by_id=cal_bank["base_position_by_id"],
-                    sites=[site],
-                    source_states=cal_source_states,
-                    bases=coarse_bases,
-                    strength=float(strength),
-                    batch_size=32,
-                    answer_label_ids=answer_label_ids,
-                    output_dtype=torch.float16,
-                )
+            candidate = {
+                "var_id": int(var_id),
+                "var_name": var_name,
+                "site_index": site_index,
+                "site": site,
+                "layer": L,
+                "coupling_mass": coupling_mass,
+            }
 
-                cal_iia = compute_iia(
-                    output_probs=cal_output,
-                    target_labels=cal_bank["counterfactual_label_ids"][var_name],
-                )
+            selected_layers.append(L)
+            selected_candidates.append(candidate)
 
-                candidate = {
-                    "var_id": int(var_id),
-                    "var_name": var_name,
-                    "site_index": int(site_index),
-                    "site": site,
-                    "layer": int(L),
-                    "strength": float(strength),
-                    "cal_iia": float(cal_iia),
-                }
+            print(
+                "[Stage A SELECT]",
+                "var=", var_name,
+                "rank=", site_pos + 1,
+                "layer=", L,
+                "mass=", coupling_mass,
+            )
 
-                stage_A_cal_results.append(candidate)
+        top_layers_var[var_id] = selected_layers
+        top_coarse_by_var[var_id] = selected_candidates
 
-                if best_candidate is None:
-                    best_candidate = candidate
-                else:
-                    if candidate["cal_iia"] > best_candidate["cal_iia"]:
-                        best_candidate = candidate
-
-                print(
-                    "[Stage A CAL]",
-                    "var=", var_name,
-                    "layer=", L,
-                    "strength=", strength,
-                    "iia=", round(float(cal_iia), 4),
-                )
-
-        best_layer_var[var_id] = int(best_candidate["layer"])
-        best_coarse_by_var[var_id] = best_candidate
-
-    # best_layer_var = {
-    #     0: 17,
-    #     1: 25
-    # }
 
     print()
-    print("[Stage A calibrated best_layer_var]", best_layer_var)
+    print("[Stage A raw top_layers_var]", top_layers_var)
+
 
     # ============================================================
-    # 5. Stage B: fine native search
+    # 5. Stage B: fine multi-layer native search
     # ============================================================
     best_by_var = {}
     stage_B_cal_results = []
@@ -888,110 +1054,38 @@ def run_plot_progressive(
 
     for var_id in range(len(names)):
         var_name = names[var_id]
-        best_layer = best_layer_var[var_id]
+        stage_A_layers = top_layers_var[var_id]
 
         best_candidate = None
 
         print()
         print("[Stage B variable]", var_id, var_name)
-        print("[Stage B layer]", best_layer)
+        print("[Stage B Stage-A layers]", stage_A_layers)
 
         for resolution in resolutions:
-            cache_key = (int(best_layer), int(resolution))
-
-            if cache_key not in fine_cache:
-                sites_fine = make_native_sites_for_layer(
-                    layer_id=best_layer,
-                    token_id=chosen_token_position_id,
-                    hidden_size=hidden_size,
-                    resolution=resolution,
-                )
-
-                sig_fine = site_signature(
-                    model=model,
-                    bank=ft_bank,
-                    sites=sites_fine,
-                    answer_label_ids=answer_label_ids,
-                    mode="neuron",
-                    k=None,
-                    strength=1.0,
-                    batch_size=32,
-                    output_dtype=torch.float16,
-                    return_bases=True,
-                )
-                
-                S_fine_sig = sig_fine["intervention_diff"]
-
-                T_fine = stage_B_solver(
-                    G_sig,
-                    S_fine_sig,
-                    eps=stage_B_eps,
-                )
-
-                fine_cache[cache_key] = {
-                    "sites_fine": sites_fine,
-                    "T_fine": T_fine,
-                    "S_fine": S_fine_sig,
-                    "bases": sig_fine["bases"],
-                }
-
-            cached = fine_cache[cache_key]
-
-            sites_fine = cached["sites_fine"]
-            T_fine = cached["T_fine"]
-            bases_fine = cached["bases"]
-
             for top_k in top_k_values:
-                selected_sites, selected_indices = select_top_sites_from_T(
-                    T=T_fine,
-                    sites=sites_fine,
-                    var_id=var_id,
-                    top_k=top_k,
-                )
-
-                cal_source_states = collect_site_activations(
-                    model=model,
-                    input_ids=cal_bank["source_input_ids"],
-                    attention_mask=cal_bank["source_attention_mask"],
-                    position_by_id=cal_bank["source_position_by_id"],
-                    sites=selected_sites,
-                    batch_size=32,
-                    return_output=False,
-                    answer_label_ids=answer_label_ids,
-                    output_dtype=torch.float16,
-                )
-
                 for strength in strength_values:
-                    cal_output = run_intervention(
+
+                    candidate = evaluate_stage_B_candidate(
                         model=model,
-                        input_ids=cal_bank["base_input_ids"],
-                        attention_mask=cal_bank["base_attention_mask"],
-                        position_by_id=cal_bank["base_position_by_id"],
-                        sites=selected_sites,
-                        source_states=cal_source_states,
-                        bases=bases_fine,
-                        strength=float(strength),
-                        batch_size=32,
+                        var_id=var_id,
+                        var_name=var_name,
+                        stage_A_layers=stage_A_layers,
+                        resolution=resolution,
+                        top_k=top_k,
+                        strength=strength,
+                        G_sig=G_sig,
+                        ft_bank=ft_bank,
+                        cal_bank=cal_bank,
+                        fine_cache=fine_cache,
+                        stage_B_solver=stage_B_solver,
+                        stage_B_eps=stage_B_eps,
                         answer_label_ids=answer_label_ids,
+                        chosen_token_position_id=chosen_token_position_id,
+                        hidden_size=hidden_size,
                         output_dtype=torch.float16,
+                        batch_size=32,
                     )
-
-                    cal_iia = compute_iia(
-                        output_probs=cal_output,
-                        target_labels=cal_bank["counterfactual_label_ids"][var_name],
-                    )
-
-                    candidate = {
-                        "var_id": int(var_id),
-                        "var_name": var_name,
-                        "best_layer": int(best_layer),
-                        "resolution": int(resolution),
-                        "top_k": int(top_k),
-                        "strength": float(strength),
-                        "cal_iia": float(cal_iia),
-                        "selected_indices": selected_indices,
-                        "selected_sites": selected_sites,
-                    }
 
                     stage_B_cal_results.append(candidate)
 
@@ -1004,16 +1098,19 @@ def run_plot_progressive(
                     print(
                         "[Stage B CAL]",
                         "var=", var_name,
-                        "layer=", best_layer,
-                        "resolution=", resolution,
-                        "top_k=", top_k,
-                        "strength=", strength,
-                        "iia=", round(float(cal_iia), 4),
+                        "layers=", candidate["stage_A_layers"],
+                        "resolution=", candidate["resolution"],
+                        "top_k=", candidate["top_k"],
+                        "strength=", candidate["strength"],
+                        "iia=", round(candidate["cal_iia"], 4),
                     )
 
         best_by_var[var_id] = best_candidate
 
-        print("[Stage B BEST]", best_candidate)
+        print()
+        print("[Stage B BEST]")
+        print(best_candidate)
+
 
     # ============================================================
     # 6. Final test on D_te
@@ -1024,14 +1121,22 @@ def run_plot_progressive(
         best_candidate = best_by_var[var_id]
 
         var_name = best_candidate["var_name"]
-        best_layer = best_candidate["best_layer"]
+        stage_A_layers = best_candidate["stage_A_layers"]
         resolution = best_candidate["resolution"]
         selected_sites = best_candidate["selected_sites"]
         strength = best_candidate["strength"]
 
-        cache_key = (int(best_layer), int(resolution))
+        cache_key = (
+            tuple(stage_A_layers),
+            int(resolution),
+        )
+
         bases_fine = fine_cache[cache_key]["bases"]
 
+        # --------------------------------------------------------
+        # Collect source activations from all selected sites
+        # potentially across multiple layers
+        # --------------------------------------------------------
         te_source_states = collect_site_activations(
             model=model,
             input_ids=te_bank["source_input_ids"],
@@ -1044,6 +1149,10 @@ def run_plot_progressive(
             output_dtype=torch.float16,
         )
 
+        # --------------------------------------------------------
+        # Sequential multi-layer intervention should happen
+        # inside run_intervention()
+        # --------------------------------------------------------
         te_output = run_intervention(
             model=model,
             input_ids=te_bank["base_input_ids"],
@@ -1060,7 +1169,9 @@ def run_plot_progressive(
 
         test_iia = compute_iia(
             output_probs=te_output,
-            target_labels=te_bank["counterfactual_label_ids"][var_name],
+            target_labels=te_bank[
+                "counterfactual_label_ids"
+            ][var_name],
         )
 
         final_candidate = dict(best_candidate)
@@ -1068,26 +1179,28 @@ def run_plot_progressive(
 
         test_results[var_id] = final_candidate
 
+        print()
         print(
             "[TEST]",
             "var=", var_name,
-            "layer=", best_layer,
+            "stage_A_layers=", stage_A_layers,
             "resolution=", resolution,
             "top_k=", best_candidate["top_k"],
             "strength=", strength,
+            "selected_sites=", selected_sites,
             "test_iia=", round(float(test_iia), 4),
         )
+
 
     return {
         "names": names,
         "G": G_sig,
         "T_coarse": T_coarse,
         "S_coarse": S_coarse_sig,
-        "best_layer_var": best_layer_var,
-        "best_coarse_by_var": best_coarse_by_var,
+        "top_layers_var": top_layers_var,
+        "top_coarse_by_var": top_coarse_by_var,
         "best_by_var": best_by_var,
         "test_results": test_results,
-        "stage_A_cal_results": stage_A_cal_results,
         "stage_B_cal_results": stage_B_cal_results,
         "fine_cache": fine_cache,
     }
@@ -1121,12 +1234,12 @@ if __name__ == "__main__":
         cal_size=128,
         te_size=256,
 
-        stage_A_eps=0.003,
-        stage_B_eps=0.003,
+        stage_A_eps=0.03,
+        stage_B_eps=0.03,
         stage_A_method="uot",
         stage_B_method="ot",
 
-        stage_A_top_layers=6,
+        stage_A_top_layers=2,
 
         resolutions=(128, 144, 192, 256, 288, 384, 576, 768),
         top_k_values=(1, 2, 3, 4, 5),

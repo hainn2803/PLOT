@@ -3,15 +3,17 @@ import os
 import re
 from datasets import load_dataset
 from mcqa_neural_net import load_gemma_model
-from mcqa_constants import DATASET_PATH
+from mcqa_constants import DATASET_PATH, HF_TOKEN
 from functools import lru_cache
 
 
 print(torch.cuda.is_available())
 print(torch.cuda.get_device_name(0))
 
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(SCRIPT_DIR, "hf_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.environ["HF_TOKEN"] = HF_TOKEN
 
 def choice_labels_from_prompt(prompt):
     labels = re.findall(r"(?m)^\s*([A-Z])\.\s+", prompt)
@@ -212,97 +214,271 @@ def select_correct_pairs(model, tokenizer, base_prompts, base_letters,
     return kept, base_ids, base_mask, source_ids, source_mask
 
 
+def _add_pair(ex, source_prompt_key, source_answer_key):
+    base_prompt = ex["base_prompt"]
+    base_answer_letter = ex["base_answer_letter"]
 
-def build_bank_single_target_variable(model, tokenizer, target_variable, bank_size,
-               answer_letters=("A", "B", "C", "D"), device="cuda",
-               example_offset=0, oversample=2, filter_batch_size=32):
-    """Build a filtered, tokenized bank of (base, source) pairs for one variable.
- 
-    Steps: load -> keep pairs Gemma answers correctly on BOTH sides -> tokenize
-    kept prompts -> record answer-token positions and labels.
- 
-    Args:
-        model, tokenizer:  loaded Gemma-2 LM and its tokenizer.
-        target_variable:   'answer_pointer' or 'answer_token'; selects which
-                           counterfactual column is the source.
-        bank_size:         int, number of pairs to keep.
-        answer_letters:    tuple[str], the label space (defines label ids 0..L-1).
-        device:            'cuda' or 'cpu'.
-        example_offset:    int, skip this many rows first (for disjoint ft/cal/te banks).
-        oversample:        int, load oversample*bank_size rows to absorb filtering.
-        filter_batch_size: int, batch size for the correctness filter.
-    Returns:
-        dict of parallel tensors/lists (entry i is one pair):
-            base/source_input_ids, base/source_attention_mask : [bank, seq] tokenized prompts
-            base/source_answer_positions                       : [bank] unpadded answer-token index
-            base/source_position_by_id                         : {'correct_symbol': the above}
-            base_answer_token_ids, counterfactual_token_ids    : [bank] real token ids (for IIA argmax)
-            base_answer_label_ids, counterfactual_label_ids    : [bank] label ids 0..L-1 (for signatures)
-            label_space                                        : [L] answer-letter token ids
-            counterfactual_letters                             : list[str] source answer letters
-    """
-    source_prompt_key, source_letter_key = {
-        "answer_pointer": ("source_prompt_pointer", "source_answer_letter_pointer"),
-        "answer_token": ("source_prompt_token", "source_prompt_token"),
-    }[target_variable]
- 
-    # 1) load text (oversample to absorb the filter), skipping example_offset rows
-    examples = load_mcqa_dataset(example_offset + bank_size * oversample)[example_offset:]
-    base_prompts = [ex["base_prompt"] for ex in examples]
-    base_letters = [ex["base_answer_letter"] for ex in examples]
-    source_prompts = [ex[source_prompt_key] for ex in examples]
-    source_letters = [ex[source_letter_key] for ex in examples]
- 
-    # 2) keep pairs Gemma gets right on BOTH sides (early stop) AND reuse the
-    #    filter's tokenization -> kept prompts are tokenized only once
-    kept, base_input_ids, base_attention_mask, source_input_ids, source_attention_mask = (
-        select_correct_pairs(model, tokenizer, base_prompts, base_letters,
-                             source_prompts, source_letters, bank_size, device, filter_batch_size))
-    pick = lambda values: [values[i] for i in kept]
- 
-    # 3) answer-token positions + answer ids (token ids cached via letter_token_id)
-    base_positions = torch.tensor(
-        [find_index_of_letter_position_in_prompt(tokenizer, base_prompts[i], base_letters[i]) for i in kept])
-    source_positions = torch.tensor(
-        [find_index_of_letter_position_in_prompt(tokenizer, source_prompts[i], source_letters[i]) for i in kept])
-    base_answer_ids = [letter_token_id(tokenizer, base_letters[i]) for i in kept]
-    counterfactual_letters = pick(source_letters)
-    counterfactual_ids = [letter_token_id(tokenizer, l) for l in counterfactual_letters]
+    source_prompt = ex[source_prompt_key]
+    source_answer_letter = ex[source_answer_key]
 
-    # ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
-    # position_last = len(ids) - 1
- 
-    # 4) token id -> label id 0..L-1 (label_space = answer_letters)
-    label_space = [letter_token_id(tokenizer, L) for L in answer_letters]
-    token_to_label = {tid: i for i, tid in enumerate(label_space)}
-    base_answer_label_ids = [token_to_label[t] for t in base_answer_ids]
-    counterfactual_label_ids = [token_to_label[t] for t in counterfactual_ids]
- 
-    return {
-        "base_input_ids": base_input_ids,
-        "base_attention_mask": base_attention_mask,
-        "source_input_ids": source_input_ids,
-        "source_attention_mask": source_attention_mask,
-        "base_answer_positions": base_positions,
-        "source_answer_positions": source_positions,
-        "base_position_by_id": {
-            "correct_symbol": base_positions,
-            "correct_symbol_period": base_positions + 1,
-            "last_token": base_attention_mask.sum(1) - 1,
-            },
-        "source_position_by_id": {
-            "correct_symbol": source_positions, 
-            "correct_symbol_period": source_positions + 1,
-            "last_token": source_attention_mask.sum(1) - 1,
-            },
-        "base_answer_token_ids": torch.tensor(base_answer_ids),
-        "counterfactual_token_ids": torch.tensor(counterfactual_ids),
-        "base_answer_label_ids": torch.tensor(base_answer_label_ids),
-        "counterfactual_label_ids": torch.tensor(counterfactual_label_ids),
-        "label_space": torch.tensor(label_space),
-        "counterfactual_letters": counterfactual_letters,
-    }
+    # AP intervention:
+    # use source answer position, but read the letter from base choices.
+    source_relpos = find_answer_relative_position(source_prompt, source_answer_letter)
+    base_choice_labels = choice_labels_from_prompt(base_prompt)
+    cf_answer_pointer = base_choice_labels[source_relpos]
 
+    # AT intervention:
+    # use source answer token directly.
+    cf_answer_token = source_answer_letter
+
+    return base_prompt, base_answer_letter, source_prompt, source_answer_letter, cf_answer_pointer, cf_answer_token
+
+
+# def build_bank(
+#     model,
+#     tokenizer,
+#     target_variable=("AT", "AP"),
+#     bank_size=256,
+#     answer_letters=None,
+#     device="cuda",
+#     example_offset=0,
+#     oversample=2,
+#     filter_batch_size=32,
+#     source_families=None,
+#     shuffle_pairs=True,
+#     seed=0,
+# ):
+#     import string
+#     import random
+
+#     # ------------------------------------------------------------
+#     # 1. Normalize target variables
+#     # ------------------------------------------------------------
+#     if isinstance(target_variable, str):
+#         target_variable = [target_variable]
+
+#     target_variables = []
+
+#     for tv in target_variable:
+#         tv = tv.lower()
+
+#         if tv in {"ap", "answer_pointer", "answerposition"}:
+#             target_variables.append("answer_pointer")
+
+#         elif tv in {"at", "answer_token", "randomletter"}:
+#             target_variables.append("answer_token")
+
+#         else:
+#             raise ValueError(
+#                 f"Unknown target_variable={tv!r}. "
+#                 "Use AP/answer_pointer or AT/answer_token. "
+#                 "'both' is a source family, not a causal variable."
+#             )
+
+#     target_variables = tuple(dict.fromkeys(target_variables))
+
+#     # ------------------------------------------------------------
+#     # 2. Normalize source families
+#     # ------------------------------------------------------------
+#     if source_families is None:
+#         if set(target_variables) == {"answer_pointer", "answer_token"}:
+#             source_families = ("answer_pointer", "answer_token", "both")
+#         else:
+#             source_families = target_variables
+
+#     elif isinstance(source_families, str):
+#         source_families = (source_families,)
+
+#     # ------------------------------------------------------------
+#     # 3. Output label space
+#     # ------------------------------------------------------------
+#     if answer_letters is None:
+#         if "answer_token" in target_variables:
+#             answer_letters = tuple(string.ascii_uppercase)
+#         else:
+#             answer_letters = tuple("ABCD")
+#     else:
+#         answer_letters = tuple(answer_letters)
+
+#     label_space = torch.tensor(
+#         [letter_token_id(tokenizer, L) for L in answer_letters],
+#         dtype=torch.long,
+#     )
+
+#     letter_to_label = {
+#         letter: i
+#         for i, letter in enumerate(answer_letters)
+#     }
+
+#     # ------------------------------------------------------------
+#     # 4. Load raw examples
+#     # ------------------------------------------------------------
+#     examples = load_mcqa_dataset(
+#         example_offset + bank_size * oversample
+#     )[example_offset:]
+
+#     # ------------------------------------------------------------
+#     # 5. Flatten examples into base-source pairs
+#     # ------------------------------------------------------------
+#     pair_base_prompts = []
+#     pair_base_letters = []
+
+#     pair_source_prompts = []
+#     pair_source_letters = []
+
+#     pair_cf_letters = {
+#         tv: []
+#         for tv in target_variables
+#     }
+
+#     for ex in examples:
+#         if "answer_pointer" in source_families:
+#             base_prompt, base_answer_letter, source_prompt, source_answer_letter, cf_answer_pointer, cf_answer_token = _add_pair(
+#                 ex,
+#                 source_prompt_key="source_prompt_pointer",
+#                 source_answer_key="source_answer_letter_pointer",
+#             )
+
+#         if "answer_token" in source_families:
+#             base_prompt, base_answer_letter, source_prompt, source_answer_letter, cf_answer_pointer, cf_answer_token = _add_pair(
+#                 ex,
+#                 source_prompt_key="source_prompt_token",
+#                 source_answer_key="source_answer_letter_token",
+#             )
+
+#         if "both" in source_families:
+#             base_prompt, base_answer_letter, source_prompt, source_answer_letter, cf_answer_pointer, cf_answer_token = _add_pair(
+#                 ex,
+#                 source_prompt_key="source_prompt_both",
+#                 source_answer_key="source_answer_letter_both",
+#             )
+
+#         pair_base_prompts.append(base_prompt)
+#         pair_base_letters.append(base_answer_letter)
+
+#         pair_source_prompts.append(source_prompt)
+#         pair_source_letters.append(source_answer_letter)
+
+#         for tv in target_variables:
+#             if tv == "answer_pointer":
+#                 pair_cf_letters[tv].append(cf_answer_pointer)
+
+#             elif tv == "answer_token":
+#                 pair_cf_letters[tv].append(cf_answer_token)
+
+#     # ------------------------------------------------------------
+#     # 6. Shuffle flattened pairs before filtering
+#     # ------------------------------------------------------------
+#     if shuffle_pairs:
+#         rng = random.Random(seed)
+#         order = list(range(len(pair_base_prompts)))
+#         rng.shuffle(order)
+
+#         pair_base_prompts = [pair_base_prompts[i] for i in order]
+#         pair_base_letters = [pair_base_letters[i] for i in order]
+
+#         pair_source_prompts = [pair_source_prompts[i] for i in order]
+#         pair_source_letters = [pair_source_letters[i] for i in order]
+
+#         for tv in target_variables:
+#             pair_cf_letters[tv] = [
+#                 pair_cf_letters[tv][i]
+#                 for i in order
+#             ]
+
+#     # ------------------------------------------------------------
+#     # 7. Keep only pairs where model predicts base and source correctly
+#     # ------------------------------------------------------------
+#     kept, base_input_ids, base_attention_mask, source_input_ids, source_attention_mask = (
+#         select_correct_pairs(
+#             model=model,
+#             tokenizer=tokenizer,
+#             base_prompts=pair_base_prompts,
+#             base_letters=pair_base_letters,
+#             source_prompts=pair_source_prompts,
+#             source_letters=pair_source_letters,
+#             bank_size=bank_size,
+#             device=device,
+#             batch_size=filter_batch_size,
+#         )
+#     )
+
+#     def pick(values):
+#         return [values[i] for i in kept]
+
+#     # ------------------------------------------------------------
+#     # 8. Convert base/counterfactual letters to label ids
+#     # ------------------------------------------------------------
+#     picked_base_letters = pick(pair_base_letters)
+
+#     base_answer_label_ids = torch.tensor(
+#         [letter_to_label[letter] for letter in picked_base_letters],
+#         dtype=torch.long,
+#     )
+
+#     counterfactual_label_ids = {}
+
+#     for tv in target_variables:
+#         picked_cf_letters = pick(pair_cf_letters[tv])
+
+#         counterfactual_label_ids[tv] = torch.tensor(
+#             [letter_to_label[letter] for letter in picked_cf_letters],
+#             dtype=torch.long,
+#         )
+
+#     # ------------------------------------------------------------
+#     # 9. Token positions for intervention sites
+#     # ------------------------------------------------------------
+#     base_positions = torch.tensor([
+#         find_index_of_letter_position_in_prompt(
+#             tokenizer,
+#             pair_base_prompts[i],
+#             pair_base_letters[i],
+#         )
+#         for i in kept
+#     ], dtype=torch.long)
+
+#     source_positions = torch.tensor([
+#         find_index_of_letter_position_in_prompt(
+#             tokenizer,
+#             pair_source_prompts[i],
+#             pair_source_letters[i],
+#         )
+#         for i in kept
+#     ], dtype=torch.long)
+
+#     # ------------------------------------------------------------
+#     # 10. Minimal bank needed for signature/evaluate
+#     # ------------------------------------------------------------
+#     return {
+#         "target_variables": target_variables,
+
+#         # Used by site_signature/evaluate to read only answer logits.
+#         "label_space": label_space,
+
+#         # Used by site_signature/evaluate.
+#         "base_input_ids": base_input_ids,
+#         "base_attention_mask": base_attention_mask,
+#         "source_input_ids": source_input_ids,
+#         "source_attention_mask": source_attention_mask,
+
+#         # Used by intervention code to know where to patch/read.
+#         "base_position_by_id": {
+#             "correct_symbol": base_positions,
+#             "correct_symbol_period": base_positions + 1,
+#             "last_token": base_attention_mask.sum(1) - 1,
+#         },
+
+#         "source_position_by_id": {
+#             "correct_symbol": source_positions,
+#             "correct_symbol_period": source_positions + 1,
+#             "last_token": source_attention_mask.sum(1) - 1,
+#         },
+
+#         # Used by variable_signature.
+#         "base_answer_label_ids": base_answer_label_ids,
+#         "counterfactual_label_ids": counterfactual_label_ids,
+#     }
 
 
 def build_bank(
@@ -321,6 +497,7 @@ def build_bank(
 ):
     import string
     import random
+    import torch
 
     # ------------------------------------------------------------
     # 1. Normalize target variables
@@ -342,8 +519,7 @@ def build_bank(
         else:
             raise ValueError(
                 f"Unknown target_variable={tv!r}. "
-                "Use AP/answer_pointer or AT/answer_token. "
-                "'both' is a source family, not a causal variable."
+                "Use AP/answer_pointer or AT/answer_token."
             )
 
     target_variables = tuple(dict.fromkeys(target_variables))
@@ -353,31 +529,35 @@ def build_bank(
     # ------------------------------------------------------------
     if source_families is None:
         if set(target_variables) == {"answer_pointer", "answer_token"}:
-            source_families = ("answer_pointer", "answer_token", "both")
+            source_families = (
+                "answer_pointer",
+                "answer_token",
+                "both",
+            )
         else:
             source_families = target_variables
 
     elif isinstance(source_families, str):
         source_families = (source_families,)
 
-    normalized_families = []
+    normalized_source_families = []
 
-    for fam in source_families:
-        fam = fam.lower()
+    for sf in source_families:
+        sf = sf.lower()
 
-        if fam in {"ap", "answer_pointer", "answerposition"}:
-            normalized_families.append("answer_pointer")
+        if sf in {"ap", "answer_pointer", "answerposition"}:
+            normalized_source_families.append("answer_pointer")
 
-        elif fam in {"at", "answer_token", "randomletter"}:
-            normalized_families.append("answer_token")
+        elif sf in {"at", "answer_token", "randomletter"}:
+            normalized_source_families.append("answer_token")
 
-        elif fam in {"both", "answerposition_randomletter"}:
-            normalized_families.append("both")
+        elif sf in {"both", "ap_at", "answer_pointer_answer_token"}:
+            normalized_source_families.append("both")
 
         else:
-            raise ValueError(f"Unknown source family: {fam!r}")
+            raise ValueError(f"Unknown source_family={sf!r}")
 
-    source_families = tuple(dict.fromkeys(normalized_families))
+    source_families = tuple(dict.fromkeys(normalized_source_families))
 
     # ------------------------------------------------------------
     # 3. Output label space
@@ -390,22 +570,31 @@ def build_bank(
     else:
         answer_letters = tuple(answer_letters)
 
+    label_ids = []
+
+    for letter in answer_letters:
+        label_ids.append(letter_token_id(tokenizer, letter))
+
     label_space = torch.tensor(
-        [letter_token_id(tokenizer, L) for L in answer_letters],
+        label_ids,
         dtype=torch.long,
     )
 
-    letter_to_label = {
-        letter: i
-        for i, letter in enumerate(answer_letters)
-    }
+    letter_to_label = {}
+
+    for i, letter in enumerate(answer_letters):
+        letter_to_label[letter] = i
 
     # ------------------------------------------------------------
     # 4. Load raw examples
     # ------------------------------------------------------------
+    number_of_examples = example_offset + bank_size * oversample
+
     examples = load_mcqa_dataset(
-        example_offset + bank_size * oversample
-    )[example_offset:]
+        number_of_examples=number_of_examples,
+    )
+
+    examples = examples[example_offset:]
 
     # ------------------------------------------------------------
     # 5. Flatten examples into base-source pairs
@@ -416,45 +605,39 @@ def build_bank(
     pair_source_prompts = []
     pair_source_letters = []
 
-    pair_cf_letters = {
-        tv: []
-        for tv in target_variables
-    }
+    pair_source_families = []
 
-    def add_pair(ex, source_prompt_key, source_answer_key):
-        base_prompt = ex["base_prompt"]
-        base_answer_letter = ex["base_answer_letter"]
+    pair_cf_letters = {}
 
-        source_prompt = ex[source_prompt_key]
-        source_answer_letter = ex[source_answer_key]
+    for tv in target_variables:
+        pair_cf_letters[tv] = []
 
-        # Needed only here to build AP counterfactual output.
-        source_relpos = find_answer_relative_position(
+    def append_pair(
+        ex,
+        source_family,
+        source_prompt_key,
+        source_answer_key,
+    ):
+        (
+            base_prompt,
+            base_answer_letter,
             source_prompt,
             source_answer_letter,
+            cf_answer_pointer,
+            cf_answer_token,
+        ) = _add_pair(
+            ex,
+            source_prompt_key=source_prompt_key,
+            source_answer_key=source_answer_key,
         )
-
-        base_choice_labels = choice_labels_from_prompt(base_prompt)
-
-        if source_relpos >= len(base_choice_labels):
-            raise ValueError(
-                f"source_relpos={source_relpos} out of range for "
-                f"base_choice_labels={base_choice_labels}"
-            )
-
-        # AP intervention:
-        # use source answer position, but read the letter from base choices.
-        cf_answer_pointer = base_choice_labels[source_relpos]
-
-        # AT intervention:
-        # use source answer token directly.
-        cf_answer_token = source_answer_letter
 
         pair_base_prompts.append(base_prompt)
         pair_base_letters.append(base_answer_letter)
 
         pair_source_prompts.append(source_prompt)
         pair_source_letters.append(source_answer_letter)
+
+        pair_source_families.append(source_family)
 
         for tv in target_variables:
             if tv == "answer_pointer":
@@ -465,22 +648,25 @@ def build_bank(
 
     for ex in examples:
         if "answer_pointer" in source_families:
-            add_pair(
-                ex,
+            append_pair(
+                ex=ex,
+                source_family="answer_pointer",
                 source_prompt_key="source_prompt_pointer",
                 source_answer_key="source_answer_letter_pointer",
             )
 
         if "answer_token" in source_families:
-            add_pair(
-                ex,
+            append_pair(
+                ex=ex,
+                source_family="answer_token",
                 source_prompt_key="source_prompt_token",
                 source_answer_key="source_answer_letter_token",
             )
 
         if "both" in source_families:
-            add_pair(
-                ex,
+            append_pair(
+                ex=ex,
+                source_family="both",
                 source_prompt_key="source_prompt_both",
                 source_answer_key="source_answer_letter_both",
             )
@@ -490,48 +676,89 @@ def build_bank(
     # ------------------------------------------------------------
     if shuffle_pairs:
         rng = random.Random(seed)
-        order = list(range(len(pair_base_prompts)))
+
+        order = []
+
+        for i in range(len(pair_base_prompts)):
+            order.append(i)
+
         rng.shuffle(order)
 
-        pair_base_prompts = [pair_base_prompts[i] for i in order]
-        pair_base_letters = [pair_base_letters[i] for i in order]
+        old_pair_base_prompts = pair_base_prompts
+        old_pair_base_letters = pair_base_letters
 
-        pair_source_prompts = [pair_source_prompts[i] for i in order]
-        pair_source_letters = [pair_source_letters[i] for i in order]
+        old_pair_source_prompts = pair_source_prompts
+        old_pair_source_letters = pair_source_letters
+
+        old_pair_source_families = pair_source_families
+        old_pair_cf_letters = pair_cf_letters
+
+        pair_base_prompts = []
+        pair_base_letters = []
+
+        pair_source_prompts = []
+        pair_source_letters = []
+
+        pair_source_families = []
+
+        for i in order:
+            pair_base_prompts.append(old_pair_base_prompts[i])
+            pair_base_letters.append(old_pair_base_letters[i])
+
+            pair_source_prompts.append(old_pair_source_prompts[i])
+            pair_source_letters.append(old_pair_source_letters[i])
+
+            pair_source_families.append(old_pair_source_families[i])
+
+        pair_cf_letters = {}
 
         for tv in target_variables:
-            pair_cf_letters[tv] = [
-                pair_cf_letters[tv][i]
-                for i in order
-            ]
+            pair_cf_letters[tv] = []
+
+            for i in order:
+                pair_cf_letters[tv].append(old_pair_cf_letters[tv][i])
 
     # ------------------------------------------------------------
     # 7. Keep only pairs where model predicts base and source correctly
     # ------------------------------------------------------------
-    kept, base_input_ids, base_attention_mask, source_input_ids, source_attention_mask = (
-        select_correct_pairs(
-            model=model,
-            tokenizer=tokenizer,
-            base_prompts=pair_base_prompts,
-            base_letters=pair_base_letters,
-            source_prompts=pair_source_prompts,
-            source_letters=pair_source_letters,
-            bank_size=bank_size,
-            device=device,
-            batch_size=filter_batch_size,
-        )
+    (
+        kept,
+        base_input_ids,
+        base_attention_mask,
+        source_input_ids,
+        source_attention_mask,
+    ) = select_correct_pairs(
+        model=model,
+        tokenizer=tokenizer,
+        base_prompts=pair_base_prompts,
+        base_letters=pair_base_letters,
+        source_prompts=pair_source_prompts,
+        source_letters=pair_source_letters,
+        bank_size=bank_size,
+        device=device,
+        batch_size=filter_batch_size,
     )
 
     def pick(values):
-        return [values[i] for i in kept]
+        picked = []
+
+        for i in kept:
+            picked.append(values[i])
+
+        return picked
 
     # ------------------------------------------------------------
     # 8. Convert base/counterfactual letters to label ids
     # ------------------------------------------------------------
     picked_base_letters = pick(pair_base_letters)
 
+    base_label_values = []
+
+    for letter in picked_base_letters:
+        base_label_values.append(letter_to_label[letter])
+
     base_answer_label_ids = torch.tensor(
-        [letter_to_label[letter] for letter in picked_base_letters],
+        base_label_values,
         dtype=torch.long,
     )
 
@@ -540,65 +767,84 @@ def build_bank(
     for tv in target_variables:
         picked_cf_letters = pick(pair_cf_letters[tv])
 
+        cf_label_values = []
+
+        for letter in picked_cf_letters:
+            cf_label_values.append(letter_to_label[letter])
+
         counterfactual_label_ids[tv] = torch.tensor(
-            [letter_to_label[letter] for letter in picked_cf_letters],
+            cf_label_values,
             dtype=torch.long,
         )
 
     # ------------------------------------------------------------
     # 9. Token positions for intervention sites
     # ------------------------------------------------------------
-    base_positions = torch.tensor([
-        find_index_of_letter_position_in_prompt(
+    picked_base_positions = []
+    picked_source_positions = []
+
+    for i in kept:
+        base_pos = find_index_of_letter_position_in_prompt(
             tokenizer,
             pair_base_prompts[i],
             pair_base_letters[i],
         )
-        for i in kept
-    ], dtype=torch.long)
 
-    source_positions = torch.tensor([
-        find_index_of_letter_position_in_prompt(
+        source_pos = find_index_of_letter_position_in_prompt(
             tokenizer,
             pair_source_prompts[i],
             pair_source_letters[i],
         )
-        for i in kept
-    ], dtype=torch.long)
+
+        picked_base_positions.append(base_pos)
+        picked_source_positions.append(source_pos)
+
+    base_positions = torch.tensor(
+        picked_base_positions,
+        dtype=torch.long,
+    )
+
+    source_positions = torch.tensor(
+        picked_source_positions,
+        dtype=torch.long,
+    )
+
+    base_last_token_positions = base_attention_mask.sum(dim=1) - 1
+    source_last_token_positions = source_attention_mask.sum(dim=1) - 1
+
+    picked_source_families = pick(pair_source_families)
 
     # ------------------------------------------------------------
-    # 10. Minimal bank needed for signature/evaluate
+    # 10. Return bank
     # ------------------------------------------------------------
     return {
         "target_variables": target_variables,
+        "source_families": source_families,
+        "pair_source_families": picked_source_families,
 
-        # Used by site_signature/evaluate to read only answer logits.
         "label_space": label_space,
 
-        # Used by site_signature/evaluate.
         "base_input_ids": base_input_ids,
         "base_attention_mask": base_attention_mask,
+
         "source_input_ids": source_input_ids,
         "source_attention_mask": source_attention_mask,
 
-        # Used by intervention code to know where to patch/read.
         "base_position_by_id": {
             "correct_symbol": base_positions,
             "correct_symbol_period": base_positions + 1,
-            "last_token": base_attention_mask.sum(1) - 1,
+            "last_token": base_last_token_positions,
         },
 
         "source_position_by_id": {
             "correct_symbol": source_positions,
             "correct_symbol_period": source_positions + 1,
-            "last_token": source_attention_mask.sum(1) - 1,
+            "last_token": source_last_token_positions,
         },
 
-        # Used by variable_signature.
         "base_answer_label_ids": base_answer_label_ids,
         "counterfactual_label_ids": counterfactual_label_ids,
     }
-
 
 
  
@@ -606,21 +852,25 @@ if __name__ == "__main__":
     model, tokenizer = load_gemma_model()
     device = next(model.parameters()).device
 
-    bank = build_bank(
-        model=model,
-        tokenizer=tokenizer,
-        target_variable=["AT", "AP"],
-        bank_size=64,
-        device=device,
-        oversample=4,
-    )
+    dataset = load_mcqa_dataset(number_of_examples=10, split="train")
 
-    print(bank["target_variables"])
-    print(bank["answer_letters"])
-    print(bank["base_input_ids"].shape)
+    print(dataset[0])
 
-    print(bank["targets"]["answer_pointer"]["source_input_ids"].shape)
-    print(bank["targets"]["answer_token"]["source_input_ids"].shape)
+    # bank = build_bank(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     target_variable=["AT", "AP"],
+    #     bank_size=64,
+    #     device=device,
+    #     oversample=4,
+    # )
 
-    print(torch.unique(bank["targets"]["answer_pointer"]["counterfactual_label_ids"]))
-    print(torch.unique(bank["targets"]["answer_token"]["counterfactual_label_ids"]))
+    # print(bank["target_variables"])
+    # print(bank["answer_letters"])
+    # print(bank["base_input_ids"].shape)
+
+    # print(bank["targets"]["answer_pointer"]["source_input_ids"].shape)
+    # print(bank["targets"]["answer_token"]["source_input_ids"].shape)
+
+    # print(torch.unique(bank["targets"]["answer_pointer"]["counterfactual_label_ids"]))
+    # print(torch.unique(bank["targets"]["answer_token"]["counterfactual_label_ids"]))
