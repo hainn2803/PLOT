@@ -364,6 +364,8 @@ def run_intervention(
         device=device,
     ).flatten()
 
+    print(site_weights)
+
     if site_weights.numel() != len(sites):
         raise ValueError(
             "site_weights must have one value per selected site"
@@ -375,6 +377,7 @@ def run_intervention(
         )
 
     weight_sum = site_weights.sum()
+    print(weight_sum)
 
     if float(weight_sum.abs().item()) == 0.0:
         raise ValueError(
@@ -683,66 +686,18 @@ def site_signature(
 
 
 
-def select_top_sites_from_T(T, sites, var_id, top_k):
-    scores = T[var_id]
-    top_k = min(int(top_k), len(sites))
-
-    values, indices = torch.topk(scores, k=top_k)
-
-    selected_sites = []
-    selected_indices = []
-
-    for idx in indices.tolist():
-        selected_sites.append(sites[int(idx)])
-        selected_indices.append(int(idx))
-
-    return selected_sites, selected_indices
-
-
-
-
-@torch.no_grad()
-def greedy_select_sites_on_cal(
-    model,
+def select_top_sites_from_T(
+    T,
+    sites,
     var_id,
-    var_name,
-    sites_fine,
-    T_fine,
-    bases_fine,
-    cal_bank,
-    cal_source_states,
-    answer_label_ids,
-    strength,
-    max_k,
-    candidate_pool_size=12,
-    batch_size=32,
-    output_dtype=torch.float16,
+    top_k,
+    min_mass=1e-8,
 ):
-    """
-    Forward greedy conditional selection on D_cal.
+    scores = T[var_id]
 
-    Pipeline:
-        1. Remove sites with non-positive or non-finite OT mass.
-        2. Among remaining sites, use OT mass to build a top-M shortlist.
-        3. At each greedy step, try adding every remaining shortlisted site.
-        4. Evaluate the joint intervention of the whole trial subset.
-        5. Commit the site giving the highest calibration IIA.
-
-    OT coupling masses are still used as soft intervention weights.
-    run_intervention() renormalizes them over the current subset.
-    """
-
-    # ========================================================
-    # 1. Get OT scores for this variable
-    # ========================================================
-    scores = T_fine[var_id]
-
-    # ========================================================
-    # 2. Remove zero / negative / NaN / Inf mass sites
-    # ========================================================
     valid_indices = []
 
-    for site_idx in range(len(sites_fine)):
+    for site_idx in range(len(sites)):
         mass = scores[site_idx]
 
         if not bool(torch.isfinite(mass).item()):
@@ -752,7 +707,7 @@ def greedy_select_sites_on_cal(
             mass.detach().cpu().item()
         )
 
-        if mass_value <= 0.0:
+        if mass_value <= float(min_mass):
             continue
 
         valid_indices.append(
@@ -761,34 +716,15 @@ def greedy_select_sites_on_cal(
 
     if len(valid_indices) == 0:
         raise ValueError(
-            f"No positive finite OT-mass sites "
-            f"for var_id={var_id}, var_name={var_name}"
+            f"No finite OT-mass sites with mass >= {min_mass} "
+            f"for var_id={var_id}"
         )
 
-    # ========================================================
-    # 3. Determine shortlist size
-    #
-    # Ensure pool is at least as large as requested max_k,
-    # whenever enough positive-mass sites exist.
-    # ========================================================
-    requested_pool_size = max(
-        int(candidate_pool_size),
-        int(max_k),
-    )
-
-    pool_size = min(
-        requested_pool_size,
+    top_k = min(
+        int(top_k),
         len(valid_indices),
     )
 
-    max_k = min(
-        int(max_k),
-        pool_size,
-    )
-
-    # ========================================================
-    # 4. Rank only positive-mass sites by OT mass
-    # ========================================================
     valid_scores = []
 
     for site_idx in valid_indices:
@@ -803,201 +739,27 @@ def greedy_select_sites_on_cal(
 
     _, local_top_indices = torch.topk(
         valid_scores,
-        k=pool_size,
+        k=top_k,
     )
 
-    # Map local indices back to original sites_fine indices
-    pool_indices = []
+    selected_sites = []
+    selected_indices = []
 
     for local_idx in local_top_indices.tolist():
-        original_idx = valid_indices[
+        site_idx = valid_indices[
             int(local_idx)
         ]
 
-        pool_indices.append(
-            int(original_idx)
+        selected_sites.append(
+            sites[site_idx]
+        )
+        selected_indices.append(
+            int(site_idx)
         )
 
-    # ========================================================
-    # 5. Greedy conditional selection
-    # ========================================================
-    selected_indices = []
-    remaining_indices = pool_indices.copy()
-    greedy_path = []
+    return selected_sites, selected_indices
 
-    for step in range(max_k):
 
-        best_trial = None
-
-        # ----------------------------------------------------
-        # Try adding every remaining candidate
-        # ----------------------------------------------------
-        for candidate_index in remaining_indices:
-
-            # Current subset + candidate
-            trial_indices = selected_indices.copy()
-
-            trial_indices.append(
-                int(candidate_index)
-            )
-
-            # Build corresponding site list
-            trial_sites = []
-
-            for site_idx in trial_indices:
-                trial_sites.append(
-                    sites_fine[int(site_idx)]
-                )
-
-            # ------------------------------------------------
-            # Use OT masses as soft intervention weights
-            #
-            # Keep original dtype here. Do not cast to float32
-            # before normalization, because tiny positive OT
-            # masses may underflow to zero.
-            # ------------------------------------------------
-            trial_weights = T_fine[
-                var_id,
-                trial_indices,
-            ]
-
-            trial_weights = (
-                trial_weights
-                .detach()
-                .cpu()
-            )
-
-            # ------------------------------------------------
-            # Joint intervention for the whole trial subset
-            # ------------------------------------------------
-            cal_output = run_intervention(
-                model=model,
-                input_ids=cal_bank["base_input_ids"],
-                attention_mask=cal_bank["base_attention_mask"],
-                position_by_id=cal_bank[
-                    "base_position_by_id"
-                ],
-                sites=trial_sites,
-                site_weights=trial_weights,
-                source_states=cal_source_states,
-                bases=bases_fine,
-                strength=float(strength),
-                batch_size=batch_size,
-                answer_label_ids=answer_label_ids,
-                output_dtype=output_dtype,
-            )
-
-            # ------------------------------------------------
-            # Calibration IIA
-            # ------------------------------------------------
-            cal_iia = compute_iia(
-                output_probs=cal_output,
-                target_labels=cal_bank[
-                    "counterfactual_label_ids"
-                ][var_name],
-            )
-
-            trial = {
-                "added_index": int(candidate_index),
-                "selected_indices": trial_indices,
-                "selected_sites": trial_sites,
-                "selected_weights": trial_weights,
-                "cal_iia": float(cal_iia),
-            }
-
-            # ------------------------------------------------
-            # Keep trial with highest IIA
-            # ------------------------------------------------
-            if best_trial is None:
-                best_trial = trial
-
-            else:
-                if (
-                    trial["cal_iia"]
-                    > best_trial["cal_iia"]
-                ):
-                    best_trial = trial
-
-                # --------------------------------------------
-                # Tie-break:
-                # if equal IIA, prefer candidate with
-                # larger OT mass
-                # --------------------------------------------
-                elif (
-                    trial["cal_iia"]
-                    == best_trial["cal_iia"]
-                ):
-                    trial_mass = float(
-                        T_fine[
-                            var_id,
-                            candidate_index,
-                        ]
-                        .detach()
-                        .cpu()
-                        .item()
-                    )
-
-                    best_mass = float(
-                        T_fine[
-                            var_id,
-                            best_trial["added_index"],
-                        ]
-                        .detach()
-                        .cpu()
-                        .item()
-                    )
-
-                    if trial_mass > best_mass:
-                        best_trial = trial
-
-        # ====================================================
-        # 6. Stop if nothing valid was found
-        # ====================================================
-        if best_trial is None:
-            break
-
-        # ====================================================
-        # 7. Commit best candidate for this greedy step
-        # ====================================================
-        selected_indices = (
-            best_trial[
-                "selected_indices"
-            ].copy()
-        )
-
-        remaining_indices.remove(
-            best_trial["added_index"]
-        )
-
-        greedy_path.append(
-            best_trial
-        )
-
-        print(
-            "[Stage B GREEDY]",
-            "var=", var_name,
-            "strength=", strength,
-            "step=", step + 1,
-            "added_site=",
-            sites_fine[
-                best_trial["added_index"]
-            ],
-            "num_selected=",
-            len(selected_indices),
-            "iia=",
-            round(
-                best_trial["cal_iia"],
-                4,
-            ),
-        )
-
-        # ====================================================
-        # 8. No remaining positive-mass candidates
-        # ====================================================
-        if len(remaining_indices) == 0:
-            break
-
-    return greedy_path
 
 
 def compute_iia(output_probs, target_labels):
@@ -1018,7 +780,6 @@ def run_plot_progressive(
     stage_A_eps=0.001,
     stage_B_eps=0.001,
     stage_A_top_layers=6,
-    stage_B_candidate_pool_size=12,
     resolutions=(128, 144, 192, 256, 288, 384, 576, 768),
     top_k_values=range(1, 6),
     strength_values=(1, 2, 4, 8, 16, 32, 64),
@@ -1142,6 +903,7 @@ def run_plot_progressive(
     stage_A_cal_results = []
     stage_A_iia_threshold = 0.7
 
+    print(T_coarse)
     for var_id in range(len(names)):
         var_name = names[var_id]
 
@@ -1153,6 +915,7 @@ def run_plot_progressive(
             sites=coarse_sites,
             var_id=var_id,
             top_k=stage_A_top_layers,
+            min_mass=0.0
         )
 
         calibrated_candidates = []
@@ -1333,13 +1096,19 @@ def run_plot_progressive(
             )
 
 
+    top_layers_var = {
+        0: [18],
+        1: [24],
+    }
     print()
     print("[Stage A calibrated top_layers_var]")
     print(top_layers_var)
 
 
+
+
     # ============================================================
-    # 5. Stage B: fine multi-layer greedy conditional search
+    # 5. Stage B: fine multi-layer top-k OT search
     # ============================================================
     best_by_var = {}
     stage_B_cal_results = []
@@ -1348,15 +1117,6 @@ def run_plot_progressive(
     # Keep D_cal source activations out of fine_cache so they are
     # not returned/saved inside results.
     stage_B_cal_source_cache = {}
-
-    top_k_list = []
-
-    for top_k in top_k_values:
-        top_k_list.append(
-            int(top_k)
-        )
-
-    max_greedy_k = max(top_k_list)
 
     for var_id in range(len(names)):
         var_name = names[var_id]
@@ -1444,7 +1204,7 @@ def run_plot_progressive(
             # Cache D_cal source activations once per fine family.
             # collect_site_activations stores full vectors per
             # (layer, token), so the same cache works for every
-            # greedy subset from these sites.
+            # top-k subset from these sites.
             # ----------------------------------------------------
             if cache_key not in stage_B_cal_source_cache:
                 cal_source_states = collect_site_activations(
@@ -1468,37 +1228,53 @@ def run_plot_progressive(
             )
 
             # ----------------------------------------------------
-            # Build one greedy path for each global strength.
-            # path[k-1] is the greedy subset of size k.
+            # Non-greedy selection:
+            # for each top_k, take the top-k sites directly from
+            # the OT coupling row T_fine[var_id].
             # ----------------------------------------------------
-            for strength in strength_values:
-                greedy_path = greedy_select_sites_on_cal(
-                    model=model,
-                    var_id=var_id,
-                    var_name=var_name,
-                    sites_fine=sites_fine,
-                    T_fine=T_fine,
-                    bases_fine=bases_fine,
-                    cal_bank=cal_bank,
-                    cal_source_states=cal_source_states,
-                    answer_label_ids=answer_label_ids,
-                    strength=float(strength),
-                    max_k=max_greedy_k,
-                    candidate_pool_size=(
-                        stage_B_candidate_pool_size
-                    ),
-                    batch_size=32,
-                    output_dtype=torch.float16,
+            for top_k in top_k_values:
+                selected_sites, selected_indices = (
+                    select_top_sites_from_T(
+                        T=T_fine,
+                        sites=sites_fine,
+                        var_id=var_id,
+                        top_k=top_k,
+                    )
                 )
 
-                for path_idx in range(len(greedy_path)):
-                    top_k = path_idx + 1
+                selected_weights = T_fine[
+                    var_id,
+                    selected_indices,
+                ]
 
-                    if top_k not in top_k_list:
-                        continue
+                selected_weights = (
+                    selected_weights
+                    .detach()
+                    .float()
+                    .cpu()
+                )
 
-                    greedy_result = (
-                        greedy_path[path_idx]
+                for strength in strength_values:
+                    cal_output = run_intervention(
+                        model=model,
+                        input_ids=cal_bank["base_input_ids"],
+                        attention_mask=cal_bank["base_attention_mask"],
+                        position_by_id=cal_bank["base_position_by_id"],
+                        sites=selected_sites,
+                        site_weights=selected_weights,
+                        source_states=cal_source_states,
+                        bases=bases_fine,
+                        strength=float(strength),
+                        batch_size=32,
+                        answer_label_ids=answer_label_ids,
+                        output_dtype=torch.float16,
+                    )
+
+                    cal_iia = compute_iia(
+                        output_probs=cal_output,
+                        target_labels=cal_bank[
+                            "counterfactual_label_ids"
+                        ][var_name],
                     )
 
                     candidate = {
@@ -1506,37 +1282,15 @@ def run_plot_progressive(
                         "var_name": var_name,
                         "stage_A_layers": layer_key,
                         "resolution": int(resolution),
-                        "top_k": int(top_k),
+                        "top_k": int(len(selected_sites)),
+                        "requested_top_k": int(top_k),
                         "strength": float(strength),
-                        "cal_iia": float(
-                            greedy_result["cal_iia"]
-                        ),
-                        "selected_indices": (
-                            greedy_result[
-                                "selected_indices"
-                            ]
-                        ),
-                        "selected_sites": (
-                            greedy_result[
-                                "selected_sites"
-                            ]
-                        ),
-                        "selected_weights": (
-                            greedy_result[
-                                "selected_weights"
-                            ]
-                        ),
+                        "cal_iia": float(cal_iia),
+                        "selected_indices": selected_indices,
+                        "selected_sites": selected_sites,
+                        "selected_weights": selected_weights,
                         "cache_key": cache_key,
-                        "selection_method": "greedy",
-                        "candidate_pool_size": int(
-                            min(
-                                max(
-                                    stage_B_candidate_pool_size,
-                                    max_greedy_k,
-                                ),
-                                len(sites_fine),
-                            )
-                        ),
+                        "selection_method": "top_k_ot",
                     }
 
                     stage_B_cal_results.append(
@@ -1553,11 +1307,12 @@ def run_plot_progressive(
                             best_candidate = candidate
 
                     print(
-                        "[Stage B CAL GREEDY]",
+                        "[Stage B CAL]",
                         "var=", var_name,
                         "layers=", layer_key,
                         "resolution=", resolution,
-                        "top_k=", top_k,
+                        "top_k=", len(selected_sites),
+                        "requested_top_k=", top_k,
                         "strength=", strength,
                         "iia=", round(
                             candidate["cal_iia"],
@@ -1568,7 +1323,7 @@ def run_plot_progressive(
         best_by_var[var_id] = best_candidate
 
         print()
-        print("[Stage B BEST GREEDY]")
+        print("[Stage B BEST]")
         print(best_candidate)
 
 
@@ -1700,11 +1455,10 @@ if __name__ == "__main__":
         stage_A_method="uot",
         stage_B_method="ot",
 
-        stage_A_top_layers=3,
-        stage_B_candidate_pool_size=12,
+        stage_A_top_layers=1,
 
-        resolutions = (128, 144, 192, 256, 288, 384),
-        top_k_values = range(1, 6),
+        resolutions = (128, 144, 192, 256, 288, 384, 576, 768),
+        top_k_values = range(1, 9),
         strength_values = (1, 2, 4, 8, 16, 32, 64, 128),
 
         chosen_token_position_id="last_token",

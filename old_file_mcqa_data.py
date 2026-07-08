@@ -856,18 +856,20 @@ if __name__ == "__main__":
 
     print(dataset[0])
 
-    # bank = build_bank(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     target_variable=["AT", "AP"],
-    #     bank_size=64,
-    #     device=device,
-    #     oversample=4,
-    # )
+    bank = build_bank(
+        model=model,
+        tokenizer=tokenizer,
+        target_variable=["AT", "AP"],
+        bank_size=64,
+        device=device,
+        oversample=4,
+    )
 
     # print(bank["target_variables"])
     # print(bank["answer_letters"])
     # print(bank["base_input_ids"].shape)
+
+    print(bank["pair_source_families"])
 
     # print(bank["targets"]["answer_pointer"]["source_input_ids"].shape)
     # print(bank["targets"]["answer_token"]["source_input_ids"].shape)
